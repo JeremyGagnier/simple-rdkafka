@@ -1,23 +1,23 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::error::Error;
-use std::io::{BufReader, Cursor};
+use std::io::Cursor;
 
 use ciborium;
 
-use rdkafka::Message;
 use rdkafka::config::{ClientConfig, RDKafkaLogLevel};
+use rdkafka::consumer::Consumer;
 use rdkafka::consumer::stream_consumer::StreamConsumer;
-use rdkafka::consumer::{Consumer, DefaultConsumerContext, MessageStream};
 use rdkafka::error::{KafkaError, KafkaResult};
 use rdkafka::message::BorrowedMessage;
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::util::Timeout;
+use rdkafka::{Message, TopicPartitionList};
 use tokio;
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, sleep, timeout};
 
-use serde::{Deserialize, Serialize, de};
+use serde::{Deserialize, Serialize, de, ser};
 
 struct MessageReverseOrd(BorrowedMessage<'static>);
 impl Ord for MessageReverseOrd {
@@ -44,7 +44,6 @@ impl Eq for MessageReverseOrd {}
 pub struct KafkaProducerConfig {
     pub host_addrs: Vec<String>,
     pub topic_name: String,
-    pub require_ack: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -54,13 +53,109 @@ pub struct KafkaConsumerConfig {
     pub group_name: String,
     pub skip_to_latest: bool,
     pub max_threads: i32,
+    pub dlq_config: Option<KafkaProducerConfig>,
+}
+
+pub struct SimpleProducer {
+    producer: FutureProducer,
+    topic_name: String,
+}
+
+pub enum ProducerError {
+    KafkaError {
+        error: KafkaError,
+    },
+    EncoderError {
+        error: ciborium::ser::Error<std::io::Error>,
+    },
+}
+
+impl SimpleProducer {
+    pub fn new(config: KafkaProducerConfig) -> KafkaResult<SimpleProducer> {
+        let producer = ClientConfig::new()
+            .set("bootstrap.servers", config.host_addrs.join(","))
+            .set("queue.buffering.max.ms", "0") // Do not buffer
+            .create()?;
+        Ok(SimpleProducer {
+            topic_name: config.topic_name,
+            producer,
+        })
+    }
+
+    async fn produce<K, V, F>(
+        &self,
+        key: &K,
+        value: &V,
+        record_builder: F,
+    ) -> Result<(), ProducerError>
+    where
+        K: ser::Serialize,
+        V: ser::Serialize,
+        F: Fn(FutureRecord<'_, Vec<u8>, Vec<u8>>) -> FutureRecord<'_, Vec<u8>, Vec<u8>>,
+    {
+        let mut key_bytes: Vec<u8> = Vec::new();
+        let mut payload: Vec<u8> = Vec::new();
+        ciborium::into_writer(&key, &mut key_bytes)
+            .map_err(|error| ProducerError::EncoderError { error })?;
+        ciborium::into_writer(&value, &mut payload)
+            .map_err(|error| ProducerError::EncoderError { error })?;
+        let record = record_builder(
+            FutureRecord::to(&self.topic_name)
+                .key(&key_bytes)
+                .payload(&payload),
+        );
+        // FEAT: Allow configuring the timeout
+        self.producer
+            .send(record, Timeout::Never)
+            .await
+            .map_err(|error| ProducerError::KafkaError { error: error.0 })?;
+        Ok(())
+    }
+
+    pub async fn send_with_key<K: ser::Serialize, V: ser::Serialize>(
+        &self,
+        key: &K,
+        value: &V,
+    ) -> Result<(), ProducerError> {
+        self.produce(key, value, |r| r).await
+    }
+
+    pub async fn send_with_partition<T: ser::Serialize>(
+        &self,
+        message: &T,
+        partition: i32,
+    ) -> Result<(), ProducerError> {
+        self.produce(&(), message, |r| r.partition(partition)).await
+    }
+
+    pub async fn send<T: ser::Serialize>(&self, message: &T) -> Result<(), ProducerError> {
+        self.produce(&(), message, |r| r).await
+    }
+
+    pub async fn send_message(
+        &self,
+        message: &BorrowedMessage<'static>,
+    ) -> Result<(), ProducerError> {
+        let mut record = FutureRecord::to(&self.topic_name).partition(message.partition());
+        if let Some(key) = message.key() {
+            record = record.key(key);
+        }
+        if let Some(payload) = message.payload() {
+            record = record.payload(payload);
+        }
+        self.producer
+            .send(record, Timeout::Never)
+            .await
+            .map_err(|error| ProducerError::KafkaError { error: error.0 })?;
+        Ok(())
+    }
 }
 
 pub struct SimpleConsumer<T: de::DeserializeOwned, E: Error + Send> {
     consumer: StreamConsumer,
     handler: fn(&T) -> Result<(), E>,
     max_threads: i32,
-    dlq_publisher: Option<()>, // TODO: Implement publisher code
+    dlq_producer: Option<SimpleProducer>,
 }
 
 pub enum ConsumerError<E: Error> {
@@ -81,6 +176,14 @@ impl<T: de::DeserializeOwned, E: Error + Send> SimpleConsumer<T, E> {
         config: KafkaConsumerConfig,
         handler: fn(&T) -> Result<(), E>,
     ) -> KafkaResult<SimpleConsumer<T, E>> {
+        SimpleConsumer::new_with_partitions(config, handler, None)
+    }
+
+    pub fn new_with_partitions(
+        config: KafkaConsumerConfig,
+        handler: fn(&T) -> Result<(), E>,
+        partitions: Option<Vec<i32>>,
+    ) -> KafkaResult<SimpleConsumer<T, E>> {
         // TODO: Confirm the possible configuration settings
         let consumer: StreamConsumer = ClientConfig::new()
             .set("group.id", config.group_name)
@@ -91,12 +194,25 @@ impl<T: de::DeserializeOwned, E: Error + Send> SimpleConsumer<T, E> {
             .set("enable.auto.offset.store", "true")
             .set_log_level(RDKafkaLogLevel::Debug)
             .create()?;
-        consumer.subscribe(&[config.topic_name.as_str()])?;
+        if let Some(partition_ids) = partitions {
+            let mut list = TopicPartitionList::new();
+            for partition_id in partition_ids {
+                list.add_partition(&config.topic_name, partition_id);
+            }
+            consumer.assign(&list)?;
+        } else {
+            consumer.subscribe(&[config.topic_name.as_str()])?;
+        }
+        let dlq_producer = if let Some(dlq_config) = config.dlq_config {
+            Some(SimpleProducer::new(dlq_config)?)
+        } else {
+            None
+        };
         Ok(SimpleConsumer {
             consumer: consumer,
             handler: handler,
             max_threads: config.max_threads,
-            dlq_publisher: None,
+            dlq_producer: dlq_producer,
         })
     }
 
@@ -107,6 +223,7 @@ impl<T: de::DeserializeOwned, E: Error + Send> SimpleConsumer<T, E> {
         let payload = borrowed_msg
             .payload()
             .ok_or_else(|| ConsumerError::NoPayload)?;
+        // FEAT: Allow the user to select an encoding
         let message: T = ciborium::from_reader(Cursor::new(payload))
             .map_err(|error| ConsumerError::DecoderError { error: error })?;
         (self.handler)(&message).map_err(|error| ConsumerError::HandlerError { error })?;
@@ -118,20 +235,24 @@ impl<T: de::DeserializeOwned, E: Error + Send> SimpleConsumer<T, E> {
         borrowed_msg: BorrowedMessage<'static>,
     ) -> JoinHandle<BorrowedMessage<'static>> {
         tokio::spawn(async move {
-            if let Some(publisher) = self.dlq_publisher {
+            if let Some(producer) = &self.dlq_producer {
                 match self.handle(&borrowed_msg) {
-                    // HandlerErrors are retried
+                    // HandlerErrors are sent to the DLQ.
+                    // FEAT: Bundle the error with the message
                     Err(ConsumerError::HandlerError { error }) => {
-                        // TODO: Publish to DLQ
+                        while producer.send_message(&borrowed_msg).await.is_err() {
+                            sleep(Duration::from_millis(10)).await;
+                        }
                     }
                     // No payload or decoder errors are skipped
-                    Err(_) => (),
                     _ => (),
                 };
             } else {
                 // When there's no DLQ retry indefinitely
                 // FEAT: Include a handler error type that is unretryable
-                while let Err(ConsumerError::HandlerError { error }) = self.handle(&borrowed_msg) {}
+                while let Err(ConsumerError::HandlerError { error }) = self.handle(&borrowed_msg) {
+                    sleep(Duration::from_millis(10)).await;
+                }
             }
             borrowed_msg
         })
