@@ -1,10 +1,10 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::error::Error;
+use std::fmt::Debug;
 use std::io::Cursor;
 
 use ciborium;
-
 use rdkafka::config::{ClientConfig, RDKafkaLogLevel};
 use rdkafka::consumer::Consumer;
 use rdkafka::consumer::stream_consumer::StreamConsumer;
@@ -16,7 +16,6 @@ use rdkafka::{Message, TopicPartitionList};
 use tokio;
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, sleep, timeout};
-
 use serde::{Deserialize, Serialize, de, ser};
 
 struct MessageReverseOrd(BorrowedMessage<'static>);
@@ -61,6 +60,7 @@ pub struct SimpleProducer {
     topic_name: String,
 }
 
+#[derive(Debug)]
 pub enum ProducerError {
     KafkaError {
         error: KafkaError,
@@ -158,7 +158,8 @@ pub struct SimpleConsumer<T: de::DeserializeOwned, E: Error + Send> {
     dlq_producer: Option<SimpleProducer>,
 }
 
-pub enum ConsumerError<E: Error> {
+#[derive(Debug)]
+pub enum ConsumerError<E: Debug + Error> {
     KafkaError {
         error: KafkaError,
     },
@@ -240,18 +241,31 @@ impl<T: de::DeserializeOwned, E: Error + Send> SimpleConsumer<T, E> {
                     // HandlerErrors are sent to the DLQ.
                     // FEAT: Bundle the error with the message
                     Err(ConsumerError::HandlerError { error }) => {
-                        while producer.send_message(&borrowed_msg).await.is_err() {
+                        log::error!("error handling message, sending to the configured DLQ: {error:#?}");
+                        while let Err(producer_error) = producer.send_message(&borrowed_msg).await {
+                            log::error!("error publishing message to the configured DLQ: {producer_error:#?}");
                             sleep(Duration::from_millis(10)).await;
                         }
                     }
                     // No payload or decoder errors are skipped
+                    Err(error) => log::error!("error handling message, skipping: {error:#?}"),
                     _ => (),
                 };
             } else {
                 // When there's no DLQ retry indefinitely
                 // FEAT: Include a handler error type that is unretryable
-                while let Err(ConsumerError::HandlerError { error }) = self.handle(&borrowed_msg) {
-                    sleep(Duration::from_millis(10)).await;
+                loop{
+                    match self.handle(&borrowed_msg) {
+                        Err(ConsumerError::HandlerError { error }) => {
+                            log::error!("error handling message, retrying: {error:#?}");
+                            sleep(Duration::from_millis(10)).await;
+                        }
+                        Err(error) => {
+                            log::error!("error handling message, skipping: {error:#?}");
+                            break;
+                        }
+                        _ => break,
+                    }
                 }
             }
             borrowed_msg
@@ -262,10 +276,10 @@ impl<T: de::DeserializeOwned, E: Error + Send> SimpleConsumer<T, E> {
         tokio::spawn(async move {
             let mut handles: Vec<Option<JoinHandle<BorrowedMessage<'static>>>> =
                 Vec::with_capacity(self.max_threads as usize);
-            let mut offset_heap: BinaryHeap<MessageReverseOrd> = BinaryHeap::new();
             for _ in 0..self.max_threads {
                 handles.push(None);
             }
+            let mut offset_heap: BinaryHeap<MessageReverseOrd> = BinaryHeap::new();
             let mut scan_idx = 0; // The current index in handles which is empty
             let mut next_offset: i64 = -1; // The next offset to commit
             let error: ConsumerError<E>;
@@ -285,8 +299,7 @@ impl<T: de::DeserializeOwned, E: Error + Send> SimpleConsumer<T, E> {
                 // Iterate over all handles for completed ones.
                 for handle in handles.iter_mut() {
                     if handle.as_ref().is_some_and(|handle| handle.is_finished()) {
-                        // FEAT: Handle join errors more gracefully
-                        let message = handle.take().unwrap().await.expect("JoinHandle error");
+                        let message = handle.take().unwrap().await.unwrap();
                         offset_heap.push(MessageReverseOrd(message))
                     }
                 }
@@ -300,9 +313,9 @@ impl<T: de::DeserializeOwned, E: Error + Send> SimpleConsumer<T, E> {
                 }
                 if let Some(message) = commitable_message {
                     // If the commit fails it's fine because we will commit later offsets as we go.
-                    self.consumer
-                        .commit_message(&message.0, rdkafka::consumer::CommitMode::Async)
-                        .ok();
+                    if let Err(error) = self.consumer.commit_message(&message.0, rdkafka::consumer::CommitMode::Async) {
+                        log::warn!("error committing message: {error:#?}")
+                    }
                 }
                 // If we don't receive a message in 10ms then loop again to check for completed consumes.
                 if let Some(result) = timeout(Duration::from_millis(10), self.consumer.recv())

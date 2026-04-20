@@ -5,6 +5,8 @@ edition = "2024"
 
 [dependencies]
 ciborium = "0.2.2"
+env_logger = "0.11.10"
+log = "0.4.29"
 rdkafka = "0.39.0"
 serde = "1.0.228"
 tokio = "1.51.0"
