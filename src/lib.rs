@@ -3,22 +3,24 @@ use std::collections::BinaryHeap;
 use std::error::Error;
 use std::fmt::Debug;
 use std::io::Cursor;
+use std::sync::Arc;
 
 use ciborium;
 use rdkafka::config::{ClientConfig, RDKafkaLogLevel};
 use rdkafka::consumer::Consumer;
 use rdkafka::consumer::stream_consumer::StreamConsumer;
 use rdkafka::error::{KafkaError, KafkaResult};
-use rdkafka::message::BorrowedMessage;
+use rdkafka::message::OwnedMessage;
 use rdkafka::producer::{FutureProducer, FutureRecord};
+use rdkafka::topic_partition_list::Offset;
 use rdkafka::util::Timeout;
 use rdkafka::{Message, TopicPartitionList};
+use serde::{Deserialize, Serialize, de, ser};
 use tokio;
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, sleep, timeout};
-use serde::{Deserialize, Serialize, de, ser};
 
-struct MessageReverseOrd(BorrowedMessage<'static>);
+struct MessageReverseOrd(OwnedMessage);
 impl Ord for MessageReverseOrd {
     fn cmp(&self, other: &Self) -> Ordering {
         other.0.offset().cmp(&self.0.offset())
@@ -72,10 +74,21 @@ pub enum ProducerError {
 
 impl SimpleProducer {
     pub fn new(config: KafkaProducerConfig) -> KafkaResult<SimpleProducer> {
-        let producer = ClientConfig::new()
+        SimpleProducer::new_with_overrides(config, |c| c)
+    }
+
+    pub fn new_with_overrides<F>(
+        config: KafkaProducerConfig,
+        overrides: F,
+    ) -> KafkaResult<SimpleProducer>
+    where
+        F: FnOnce(&mut ClientConfig) -> &mut ClientConfig,
+    {
+        let mut empty_config = ClientConfig::new();
+        let base_config = empty_config
             .set("bootstrap.servers", config.host_addrs.join(","))
-            .set("queue.buffering.max.ms", "0") // Do not buffer
-            .create()?;
+            .set("queue.buffering.max.ms", "0"); // Do not buffer
+        let producer = overrides(base_config).create()?;
         Ok(SimpleProducer {
             topic_name: config.topic_name,
             producer,
@@ -91,7 +104,7 @@ impl SimpleProducer {
     where
         K: ser::Serialize,
         V: ser::Serialize,
-        F: Fn(FutureRecord<'_, Vec<u8>, Vec<u8>>) -> FutureRecord<'_, Vec<u8>, Vec<u8>>,
+        F: FnOnce(FutureRecord<'_, Vec<u8>, Vec<u8>>) -> FutureRecord<'_, Vec<u8>, Vec<u8>>,
     {
         let mut key_bytes: Vec<u8> = Vec::new();
         let mut payload: Vec<u8> = Vec::new();
@@ -132,10 +145,7 @@ impl SimpleProducer {
         self.produce(&(), message, |r| r).await
     }
 
-    pub async fn send_message(
-        &self,
-        message: &BorrowedMessage<'static>,
-    ) -> Result<(), ProducerError> {
+    pub async fn send_message<M: Message>(&self, message: &M) -> Result<(), ProducerError> {
         let mut record = FutureRecord::to(&self.topic_name).partition(message.partition());
         if let Some(key) = message.key() {
             record = record.key(key);
@@ -172,29 +182,53 @@ pub enum ConsumerError<E: Debug + Error> {
     NoPayload,
 }
 
-impl<T: de::DeserializeOwned, E: Error + Send> SimpleConsumer<T, E> {
+impl<T: de::DeserializeOwned + 'static, E: Error + Send + 'static> SimpleConsumer<T, E> {
     pub fn new(
         config: KafkaConsumerConfig,
         handler: fn(&T) -> Result<(), E>,
     ) -> KafkaResult<SimpleConsumer<T, E>> {
-        SimpleConsumer::new_with_partitions(config, handler, None)
+        SimpleConsumer::new_with_overrides_and_partitions(config, handler, |c| c, None)
     }
 
-    pub fn new_with_partitions(
+    pub fn new_with_overrides<F>(
+        config: KafkaConsumerConfig,
+        handler: fn(&T) -> Result<(), E>,
+        overrides: F,
+    ) -> KafkaResult<SimpleConsumer<T, E>>
+    where
+        F: FnOnce(&mut ClientConfig) -> &mut ClientConfig,
+    {
+        SimpleConsumer::new_with_overrides_and_partitions(config, handler, overrides, None)
+    }
+
+    pub fn new_with_partitions<F>(
         config: KafkaConsumerConfig,
         handler: fn(&T) -> Result<(), E>,
         partitions: Option<Vec<i32>>,
     ) -> KafkaResult<SimpleConsumer<T, E>> {
+        SimpleConsumer::new_with_overrides_and_partitions(config, handler, |c| c, partitions)
+    }
+
+    pub fn new_with_overrides_and_partitions<F>(
+        config: KafkaConsumerConfig,
+        handler: fn(&T) -> Result<(), E>,
+        overrides: F,
+        partitions: Option<Vec<i32>>,
+    ) -> KafkaResult<SimpleConsumer<T, E>>
+    where
+        F: FnOnce(&mut ClientConfig) -> &mut ClientConfig,
+    {
         // TODO: Confirm the possible configuration settings
-        let consumer: StreamConsumer = ClientConfig::new()
+        let mut empty_config = ClientConfig::new();
+        let base_config = empty_config
             .set("group.id", config.group_name)
             .set("bootstrap.servers", config.host_addrs.join(","))
             .set("enable.partition.eof", "false")
             .set("session.timeout.ms", "6000")
             .set("enable.auto.commit", "false")
             .set("enable.auto.offset.store", "true")
-            .set_log_level(RDKafkaLogLevel::Debug)
-            .create()?;
+            .set_log_level(RDKafkaLogLevel::Debug);
+        let consumer: StreamConsumer = overrides(base_config).create()?;
         if let Some(partition_ids) = partitions {
             let mut list = TopicPartitionList::new();
             for partition_id in partition_ids {
@@ -217,33 +251,30 @@ impl<T: de::DeserializeOwned, E: Error + Send> SimpleConsumer<T, E> {
         })
     }
 
-    pub fn handle<'a>(
-        &'static self,
-        borrowed_msg: &BorrowedMessage<'a>,
-    ) -> Result<(), ConsumerError<E>> {
-        let payload = borrowed_msg
-            .payload()
-            .ok_or_else(|| ConsumerError::NoPayload)?;
+    pub fn handle<M: Message>(&self, message: &M) -> Result<(), ConsumerError<E>> {
+        let payload = message.payload().ok_or_else(|| ConsumerError::NoPayload)?;
         // FEAT: Allow the user to select an encoding
-        let message: T = ciborium::from_reader(Cursor::new(payload))
+        let decoded: T = ciborium::from_reader(Cursor::new(payload))
             .map_err(|error| ConsumerError::DecoderError { error: error })?;
-        (self.handler)(&message).map_err(|error| ConsumerError::HandlerError { error })?;
+        (self.handler)(&decoded).map_err(|error| ConsumerError::HandlerError { error })?;
         Ok(())
     }
 
-    pub fn consume(
-        &'static self,
-        borrowed_msg: BorrowedMessage<'static>,
-    ) -> JoinHandle<BorrowedMessage<'static>> {
+    pub fn consume(self: &Arc<Self>, owned_msg: OwnedMessage) -> JoinHandle<OwnedMessage> {
+        let self_clone = Arc::clone(self);
         tokio::spawn(async move {
-            if let Some(producer) = &self.dlq_producer {
-                match self.handle(&borrowed_msg) {
+            if let Some(producer) = &self_clone.dlq_producer {
+                match self_clone.handle(&owned_msg) {
                     // HandlerErrors are sent to the DLQ.
                     // FEAT: Bundle the error with the message
                     Err(ConsumerError::HandlerError { error }) => {
-                        log::error!("error handling message, sending to the configured DLQ: {error:#?}");
-                        while let Err(producer_error) = producer.send_message(&borrowed_msg).await {
-                            log::error!("error publishing message to the configured DLQ: {producer_error:#?}");
+                        log::error!(
+                            "error handling message, sending to the configured DLQ: {error:#?}"
+                        );
+                        while let Err(producer_error) = producer.send_message(&owned_msg).await {
+                            log::error!(
+                                "error publishing message to the configured DLQ: {producer_error:#?}"
+                            );
                             sleep(Duration::from_millis(10)).await;
                         }
                     }
@@ -254,8 +285,8 @@ impl<T: de::DeserializeOwned, E: Error + Send> SimpleConsumer<T, E> {
             } else {
                 // When there's no DLQ retry indefinitely
                 // FEAT: Include a handler error type that is unretryable
-                loop{
-                    match self.handle(&borrowed_msg) {
+                loop {
+                    match self_clone.handle(&owned_msg) {
                         Err(ConsumerError::HandlerError { error }) => {
                             log::error!("error handling message, retrying: {error:#?}");
                             sleep(Duration::from_millis(10)).await;
@@ -268,15 +299,17 @@ impl<T: de::DeserializeOwned, E: Error + Send> SimpleConsumer<T, E> {
                     }
                 }
             }
-            borrowed_msg
+            owned_msg
         })
     }
 
-    pub async fn run_consumer(&'static mut self) -> JoinHandle<ConsumerError<E>> {
+    pub fn run_consumer(self) -> JoinHandle<ConsumerError<E>> {
+        let self_arc = Arc::new(self);
+        let self_clone = Arc::clone(&self_arc);
         tokio::spawn(async move {
-            let mut handles: Vec<Option<JoinHandle<BorrowedMessage<'static>>>> =
-                Vec::with_capacity(self.max_threads as usize);
-            for _ in 0..self.max_threads {
+            let mut handles: Vec<Option<JoinHandle<OwnedMessage>>> =
+                Vec::with_capacity(self_clone.max_threads as usize);
+            for _ in 0..self_clone.max_threads {
                 handles.push(None);
             }
             let mut offset_heap: BinaryHeap<MessageReverseOrd> = BinaryHeap::new();
@@ -290,7 +323,7 @@ impl<T: de::DeserializeOwned, E: Error + Send> SimpleConsumer<T, E> {
                     .as_ref()
                     .is_none_or(|handle| handle.is_finished())
                 {
-                    scan_idx = (scan_idx + 1) % self.max_threads as usize;
+                    scan_idx = (scan_idx + 1) % self_clone.max_threads as usize;
                     // Each time all threads are checked do a short sleep
                     if scan_idx == starting_idx {
                         sleep(Duration::from_millis(10)).await;
@@ -313,12 +346,23 @@ impl<T: de::DeserializeOwned, E: Error + Send> SimpleConsumer<T, E> {
                 }
                 if let Some(message) = commitable_message {
                     // If the commit fails it's fine because we will commit later offsets as we go.
-                    if let Err(error) = self.consumer.commit_message(&message.0, rdkafka::consumer::CommitMode::Async) {
+                    // TODO: Figure out if there is a better way to commit the offset without the heavy TopicPartitionList.
+                    let mut tpl = TopicPartitionList::new();
+                    if let Err(commit_err) = tpl.add_partition_offset(
+                        message.0.topic(),
+                        message.0.partition(),
+                        Offset::Offset(message.0.offset()),
+                    ) {
+                        log::warn!("error building commit offset list: {commit_err:#?}");
+                    } else if let Err(error) = self_clone
+                        .consumer
+                        .commit(&tpl, rdkafka::consumer::CommitMode::Async)
+                    {
                         log::warn!("error committing message: {error:#?}")
                     }
                 }
                 // If we don't receive a message in 10ms then loop again to check for completed consumes.
-                if let Some(result) = timeout(Duration::from_millis(10), self.consumer.recv())
+                if let Some(result) = timeout(Duration::from_millis(10), self_clone.consumer.recv())
                     .await
                     .ok()
                 {
@@ -335,7 +379,7 @@ impl<T: de::DeserializeOwned, E: Error + Send> SimpleConsumer<T, E> {
                             break;
                         }
                     };
-                    handles[scan_idx] = Some(self.consume(borrowed_message));
+                    handles[scan_idx] = Some(self_clone.consume(borrowed_message.detach()));
                 }
             }
             error
@@ -349,4 +393,33 @@ pub fn kafka_producer_from_config(config: KafkaProducerConfig) -> KafkaResult<Fu
         .set("bootstrap.servers", config.host_addrs.join(","))
         .set("queue.buffering.max.ms", "0") // Do not buffer
         .create()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn override_consumer_config(config: &mut ClientConfig) -> &mut ClientConfig {
+        config.set("test.mock.num.brokers", "3")
+    }
+
+    #[tokio::test]
+    async fn initialize_consumer() {
+        let test_config = KafkaConsumerConfig {
+            host_addrs: Vec::new(),
+            topic_name: "test_topic".to_string(),
+            group_name: "test_group".to_string(),
+            skip_to_latest: true,
+            max_threads: 64,
+            dlq_config: None,
+        };
+        let consumer_result = SimpleConsumer::<(), KafkaError>::new_with_overrides(
+            test_config,
+            |_: &()| Ok(()),
+            override_consumer_config,
+        );
+        assert!(consumer_result.is_ok());
+        let consumer = consumer_result.unwrap();
+        consumer.run_consumer();
+    }
 }
