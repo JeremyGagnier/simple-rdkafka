@@ -201,7 +201,7 @@ impl<T: de::DeserializeOwned + 'static, E: Error + Send + 'static> SimpleConsume
         SimpleConsumer::new_with_overrides_and_partitions(config, handler, overrides, None)
     }
 
-    pub fn new_with_partitions<F>(
+    pub fn new_with_partitions(
         config: KafkaConsumerConfig,
         handler: fn(&T) -> Result<(), E>,
         partitions: Option<Vec<i32>>,
@@ -219,6 +219,7 @@ impl<T: de::DeserializeOwned + 'static, E: Error + Send + 'static> SimpleConsume
         F: FnOnce(&mut ClientConfig) -> &mut ClientConfig,
     {
         // TODO: Confirm the possible configuration settings
+        // TODO: Skip to latest does not skip to latest if partitions are automatically assigned and there is a pre-existing commit.
         let mut empty_config = ClientConfig::new();
         let base_config = empty_config
             .set("group.id", config.group_name)
@@ -227,12 +228,28 @@ impl<T: de::DeserializeOwned + 'static, E: Error + Send + 'static> SimpleConsume
             .set("session.timeout.ms", "6000")
             .set("enable.auto.commit", "false")
             .set("enable.auto.offset.store", "true")
+            .set(
+                "auto.offset.reset",
+                if config.skip_to_latest {
+                    "latest"
+                } else {
+                    "earliest"
+                },
+            )
             .set_log_level(RDKafkaLogLevel::Debug);
         let consumer: StreamConsumer = overrides(base_config).create()?;
         if let Some(partition_ids) = partitions {
             let mut list = TopicPartitionList::new();
             for partition_id in partition_ids {
-                list.add_partition(&config.topic_name, partition_id);
+                if config.skip_to_latest {
+                    list.add_partition_offset(
+                        &config.topic_name,
+                        partition_id,
+                        Offset::End,
+                    )?;
+                } else {
+                    list.add_partition(&config.topic_name, partition_id);
+                }
             }
             consumer.assign(&list)?;
         } else {
@@ -398,9 +415,36 @@ pub fn kafka_producer_from_config(config: KafkaProducerConfig) -> KafkaResult<Fu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rdkafka::mocking::MockCluster;
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+    use std::time::Instant;
+
+    #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
+    struct TestMessage {
+        text: String,
+    }
+
+    static TEST_CONSUMED: OnceLock<Arc<Mutex<Vec<TestMessage>>>> = OnceLock::new();
+
+    fn test_handler(message: &TestMessage) -> Result<(), KafkaError> {
+        let consumed = TEST_CONSUMED.get_or_init(|| Arc::new(Mutex::new(Vec::new())));
+        consumed.lock().unwrap().push(message.clone());
+        Ok(())
+    }
+
+    fn clear_consumed() {
+        let consumed = TEST_CONSUMED.get_or_init(|| Arc::new(Mutex::new(Vec::new())));
+        consumed.lock().unwrap().clear();
+    }
 
     fn override_consumer_config(config: &mut ClientConfig) -> &mut ClientConfig {
-        config.set("test.mock.num.brokers", "3")
+        config.set("test.mock.num.brokers", "1")
+    }
+
+    fn override_producer_config(config: &mut ClientConfig) -> &mut ClientConfig {
+        config.set("test.mock.num.brokers", "1")
     }
 
     #[tokio::test]
@@ -420,6 +464,92 @@ mod tests {
         );
         assert!(consumer_result.is_ok());
         let consumer = consumer_result.unwrap();
-        consumer.run_consumer();
+        let handle = consumer.run_consumer();
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_producer_sends_message() {
+        let producer_config = KafkaProducerConfig {
+            host_addrs: Vec::new(),
+            topic_name: "test_produce_topic".to_string(),
+        };
+        let producer_result =
+            SimpleProducer::new_with_overrides(producer_config, override_producer_config);
+        assert!(producer_result.is_ok());
+        let producer = producer_result.unwrap();
+        let result = producer.send(&()).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_producer_consumer_end_to_end() {
+        clear_consumed();
+        let topic_name = "test_topic";
+        let test_msg1 = TestMessage {
+            text: "test1".to_string(),
+        };
+        let test_msg2 = TestMessage {
+            text: "test2".to_string(),
+        };
+        let test_msg3 = TestMessage {
+            text: "test3".to_string(),
+        };
+
+        let mock_cluster = MockCluster::new(1).unwrap();
+        mock_cluster.create_topic(topic_name, 1, 1).unwrap();
+        let bootstrap_servers = mock_cluster.bootstrap_servers();
+
+        let consumer_config = KafkaConsumerConfig {
+            host_addrs: vec![bootstrap_servers.clone()],
+            topic_name: topic_name.to_string(),
+            group_name: "test_e2e_group".to_string(),
+            skip_to_latest: false,
+            max_threads: 1,
+            dlq_config: None,
+        };
+        let producer_config = KafkaProducerConfig {
+            host_addrs: vec![bootstrap_servers.clone()],
+            topic_name: topic_name.to_string(),
+        };
+
+        let consumer_result = SimpleConsumer::<TestMessage, KafkaError>::new_with_partitions(
+            consumer_config,
+            test_handler,
+            Some(vec![0]),
+        );
+        assert!(consumer_result.is_ok());
+        let consumer = consumer_result.unwrap();
+
+        let producer_result = SimpleProducer::new(producer_config);
+        assert!(producer_result.is_ok());
+        let producer = producer_result.unwrap();
+
+        // Check that messages produced before the consumer starts are consumed.
+        assert!(producer.send(&test_msg1).await.is_ok());
+
+        let consumer_handle = consumer.run_consumer();
+
+        assert!(producer.send(&test_msg2).await.is_ok());
+        assert!(producer.send(&test_msg3).await.is_ok());
+
+        let timeout = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < timeout {
+            if TEST_CONSUMED.get().unwrap().lock().unwrap().len() >= 3 {
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+
+        let consumed_messages = TEST_CONSUMED.get().unwrap().lock().unwrap().clone();
+        assert_eq!(consumed_messages.len(), 3);
+
+        let received_set: HashSet<String> =
+            consumed_messages.into_iter().map(|msg| msg.text).collect();
+        assert!(received_set.contains("test1"));
+        assert!(received_set.contains("test2"));
+        assert!(received_set.contains("test3"));
+
+        consumer_handle.abort();
     }
 }
