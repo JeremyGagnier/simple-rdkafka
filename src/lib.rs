@@ -6,7 +6,7 @@ use std::io::Cursor;
 use std::sync::Arc;
 
 use ciborium;
-use rdkafka::config::{ClientConfig, RDKafkaLogLevel};
+use rdkafka::config::ClientConfig;
 use rdkafka::consumer::Consumer;
 use rdkafka::consumer::stream_consumer::StreamConsumer;
 use rdkafka::error::{KafkaError, KafkaResult};
@@ -219,7 +219,6 @@ impl<T: de::DeserializeOwned + 'static, E: Error + Send + 'static> SimpleConsume
         F: FnOnce(&mut ClientConfig) -> &mut ClientConfig,
     {
         // TODO: Confirm the possible configuration settings
-        // TODO: Skip to latest does not skip to latest if partitions are automatically assigned and there is a pre-existing commit.
         let mut empty_config = ClientConfig::new();
         let base_config = empty_config
             .set("group.id", config.group_name)
@@ -235,8 +234,7 @@ impl<T: de::DeserializeOwned + 'static, E: Error + Send + 'static> SimpleConsume
                 } else {
                     "earliest"
                 },
-            )
-            .set_log_level(RDKafkaLogLevel::Debug);
+            );
         let consumer: StreamConsumer = overrides(base_config).create()?;
         if let Some(partition_ids) = partitions {
             let mut list = TopicPartitionList::new();
@@ -254,6 +252,18 @@ impl<T: de::DeserializeOwned + 'static, E: Error + Send + 'static> SimpleConsume
             consumer.assign(&list)?;
         } else {
             consumer.subscribe(&[config.topic_name.as_str()])?;
+            // TODO: This code should be ran on post_rebalance and requires defining a CounsumerContext.
+            /*
+            if config.skip_to_latest {
+                if let Ok(tpl) = consumer.subscription() {
+                    for ((topic, partition_id), offset) in tpl.to_topic_map() {
+                        if offset != Offset::End {
+                            consumer.seek(&topic, partition_id, Offset::End, Timeout::After(Duration::from_secs(1)))?;
+                        }
+                    }
+                }
+            }
+            */
         }
         let dlq_producer = if let Some(dlq_config) = config.dlq_config {
             Some(SimpleProducer::new(dlq_config)?)
@@ -426,19 +436,6 @@ mod tests {
         text: String,
     }
 
-    static TEST_CONSUMED: OnceLock<Arc<Mutex<Vec<TestMessage>>>> = OnceLock::new();
-
-    fn test_handler(message: &TestMessage) -> Result<(), KafkaError> {
-        let consumed = TEST_CONSUMED.get_or_init(|| Arc::new(Mutex::new(Vec::new())));
-        consumed.lock().unwrap().push(message.clone());
-        Ok(())
-    }
-
-    fn clear_consumed() {
-        let consumed = TEST_CONSUMED.get_or_init(|| Arc::new(Mutex::new(Vec::new())));
-        consumed.lock().unwrap().clear();
-    }
-
     fn override_consumer_config(config: &mut ClientConfig) -> &mut ClientConfig {
         config.set("test.mock.num.brokers", "1")
     }
@@ -484,7 +481,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_producer_consumer_end_to_end() {
-        clear_consumed();
+        static CONSUMED: OnceLock<Arc<Mutex<Vec<TestMessage>>>> = OnceLock::new();
+        assert!(CONSUMED.set(Arc::new(Mutex::new(Vec::new()))).is_ok());
+        fn handler(message: &TestMessage) -> Result<(), KafkaError> {
+            CONSUMED.get().unwrap().lock().unwrap().push(message.clone());
+            Ok(())
+        }
+
         let topic_name = "test_topic";
         let test_msg1 = TestMessage {
             text: "test1".to_string(),
@@ -515,7 +518,7 @@ mod tests {
 
         let consumer_result = SimpleConsumer::<TestMessage, KafkaError>::new_with_partitions(
             consumer_config,
-            test_handler,
+            handler,
             Some(vec![0]),
         );
         assert!(consumer_result.is_ok());
@@ -533,15 +536,15 @@ mod tests {
         assert!(producer.send(&test_msg2).await.is_ok());
         assert!(producer.send(&test_msg3).await.is_ok());
 
-        let timeout = Instant::now() + Duration::from_secs(2);
+        let timeout = Instant::now() + Duration::from_secs(1);
         while Instant::now() < timeout {
-            if TEST_CONSUMED.get().unwrap().lock().unwrap().len() >= 3 {
+            if CONSUMED.get().unwrap().lock().unwrap().len() >= 3 {
                 break;
             }
             sleep(Duration::from_millis(50)).await;
         }
 
-        let consumed_messages = TEST_CONSUMED.get().unwrap().lock().unwrap().clone();
+        let consumed_messages = CONSUMED.get().unwrap().lock().unwrap().clone();
         assert_eq!(consumed_messages.len(), 3);
 
         let received_set: HashSet<String> =
@@ -551,5 +554,75 @@ mod tests {
         assert!(received_set.contains("test3"));
 
         consumer_handle.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 64)]
+    async fn test_consumer_multiple_threads() {
+        static CONSUMED: OnceLock<Arc<Mutex<Vec<()>>>> = OnceLock::new();
+        assert!(CONSUMED.set(Arc::new(Mutex::new(Vec::new()))).is_ok());
+        fn handler(message: &()) -> Result<(), KafkaError> {
+            // Use thread sleep so that the function is not async.
+            std::thread::sleep(Duration::from_millis(50));
+            CONSUMED.get().unwrap().lock().unwrap().push(*message);
+            Ok(())
+        }
+
+        let topic_name = "test_topic";
+        let mock_cluster = MockCluster::new(1).unwrap();
+        mock_cluster.create_topic(topic_name, 1, 1).unwrap();
+        let bootstrap_servers = mock_cluster.bootstrap_servers();
+
+        let consumer_config = KafkaConsumerConfig {
+            host_addrs: vec![bootstrap_servers.clone()],
+            topic_name: topic_name.to_string(),
+            group_name: "test_e2e_group".to_string(),
+            skip_to_latest: false,
+            max_threads: 64,
+            dlq_config: None,
+        };
+        let producer_config = KafkaProducerConfig {
+            host_addrs: vec![bootstrap_servers.clone()],
+            topic_name: topic_name.to_string(),
+        };
+
+        let consumer_result = SimpleConsumer::<(), KafkaError>::new_with_partitions(
+            consumer_config,
+            handler,
+            Some(vec![0]),
+        );
+        assert!(consumer_result.is_ok());
+        let consumer = consumer_result.unwrap();
+
+        let producer_result = SimpleProducer::new(producer_config);
+        assert!(producer_result.is_ok());
+        let producer = producer_result.unwrap();
+
+        let mut message_count = 0;
+        // Produce a bunch of messages so that there is a backlog to take up the threads.
+        for _ in 0..100 {
+            assert!(producer.send(&()).await.is_ok());
+            message_count += 1;
+        }
+
+        let consumer_handle = consumer.run_consumer();
+
+        for _ in 100..200 {
+            assert!(producer.send(&()).await.is_ok());
+            message_count += 1;
+        }
+
+        let timeout = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < timeout {
+            if CONSUMED.get().unwrap().lock().unwrap().len() >= message_count {
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+
+        let consumed_messages = CONSUMED.get().unwrap().lock().unwrap().clone();
+        assert_eq!(consumed_messages.len(), message_count);
+
+        consumer_handle.abort();
+
     }
 }
