@@ -84,6 +84,7 @@ impl SimpleProducer {
     where
         F: FnOnce(&mut ClientConfig) -> &mut ClientConfig,
     {
+        // FEAT: Codify the possible configuration settings as enums.
         let mut empty_config = ClientConfig::new();
         let base_config = empty_config
             .set("bootstrap.servers", config.host_addrs.join(","))
@@ -153,6 +154,7 @@ impl SimpleProducer {
         if let Some(payload) = message.payload() {
             record = record.payload(payload);
         }
+        // FEAT: Allow configuring the timeout.
         self.producer
             .send(record, Timeout::Never)
             .await
@@ -218,15 +220,13 @@ impl<T: de::DeserializeOwned + 'static, E: Error + Send + 'static> SimpleConsume
     where
         F: FnOnce(&mut ClientConfig) -> &mut ClientConfig,
     {
-        // TODO: Confirm the possible configuration settings
+        // FEAT: Codify the possible configuration settings as enums.
         let mut empty_config = ClientConfig::new();
         let base_config = empty_config
             .set("group.id", config.group_name)
             .set("bootstrap.servers", config.host_addrs.join(","))
-            .set("enable.partition.eof", "false")
-            .set("session.timeout.ms", "6000")
             .set("enable.auto.commit", "false")
-            .set("enable.auto.offset.store", "true")
+            .set("enable.auto.offset.store", "false")
             .set(
                 "auto.offset.reset",
                 if config.skip_to_latest {
@@ -252,7 +252,7 @@ impl<T: de::DeserializeOwned + 'static, E: Error + Send + 'static> SimpleConsume
             consumer.assign(&list)?;
         } else {
             consumer.subscribe(&[config.topic_name.as_str()])?;
-            // TODO: This code should be ran on post_rebalance and requires defining a CounsumerContext.
+            // FEAT: This code should be ran on post_rebalance and requires defining a CounsumerContext.
             /*
             if config.skip_to_latest {
                 if let Ok(tpl) = consumer.subscription() {
@@ -373,7 +373,7 @@ impl<T: de::DeserializeOwned + 'static, E: Error + Send + 'static> SimpleConsume
                 }
                 if let Some(message) = commitable_message {
                     // If the commit fails it's fine because we will commit later offsets as we go.
-                    // TODO: Figure out if there is a better way to commit the offset without the heavy TopicPartitionList.
+                    // FEAT: Allow the user to configure the commit mode (async vs sync)
                     let mut tpl = TopicPartitionList::new();
                     if let Err(commit_err) = tpl.add_partition_offset(
                         message.0.topic(),
@@ -389,6 +389,7 @@ impl<T: de::DeserializeOwned + 'static, E: Error + Send + 'static> SimpleConsume
                     }
                 }
                 // If we don't receive a message in 10ms then loop again to check for completed consumes.
+                // FEAT: Allow the user to configure this timeout.
                 if let Some(result) = timeout(Duration::from_millis(10), self_clone.consumer.recv())
                     .await
                     .ok()
@@ -415,10 +416,10 @@ impl<T: de::DeserializeOwned + 'static, E: Error + Send + 'static> SimpleConsume
 }
 
 pub fn kafka_producer_from_config(config: KafkaProducerConfig) -> KafkaResult<FutureProducer> {
-    // TODO: Confirm the possible configuration settings
     ClientConfig::new()
         .set("bootstrap.servers", config.host_addrs.join(","))
         .set("queue.buffering.max.ms", "0") // Do not buffer
+        .set("acks", "1") // Leader only
         .create()
 }
 
