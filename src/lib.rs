@@ -42,6 +42,16 @@ impl PartialEq for MessageReverseOrd {
 impl Eq for MessageReverseOrd {}
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct DLQMessage<E, V>
+where
+    E: Debug + Error + ser::Serialize,
+    V: ser::Serialize,
+{
+    pub error: E,
+    pub value: V,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct KafkaProducerConfig {
     pub host_addrs: Vec<String>,
     pub topic_name: String,
@@ -99,7 +109,7 @@ impl SimpleProducer {
     async fn produce<K, V, F>(
         &self,
         key: &K,
-        value: &V,
+        payload: &V,
         record_builder: F,
     ) -> Result<(), ProducerError>
     where
@@ -108,15 +118,28 @@ impl SimpleProducer {
         F: FnOnce(FutureRecord<'_, Vec<u8>, Vec<u8>>) -> FutureRecord<'_, Vec<u8>, Vec<u8>>,
     {
         let mut key_bytes: Vec<u8> = Vec::new();
-        let mut payload: Vec<u8> = Vec::new();
+        let mut payload_bytes: Vec<u8> = Vec::new();
         ciborium::into_writer(&key, &mut key_bytes)
             .map_err(|error| ProducerError::EncoderError { error })?;
-        ciborium::into_writer(&value, &mut payload)
+        ciborium::into_writer(&payload, &mut payload_bytes)
             .map_err(|error| ProducerError::EncoderError { error })?;
+        self.produce_bytes(&key_bytes, &payload_bytes, record_builder)
+            .await
+    }
+
+    async fn produce_bytes<F>(
+        &self,
+        key_bytes: &Vec<u8>,
+        payload_bytes: &Vec<u8>,
+        record_builder: F,
+    ) -> Result<(), ProducerError>
+    where
+        F: FnOnce(FutureRecord<'_, Vec<u8>, Vec<u8>>) -> FutureRecord<'_, Vec<u8>, Vec<u8>>,
+    {
         let record = record_builder(
             FutureRecord::to(&self.topic_name)
-                .key(&key_bytes)
-                .payload(&payload),
+                .key(key_bytes)
+                .payload(payload_bytes),
         );
         // FEAT: Allow configuring the timeout
         self.producer
@@ -145,22 +168,6 @@ impl SimpleProducer {
     pub async fn send<T: ser::Serialize>(&self, message: &T) -> Result<(), ProducerError> {
         self.produce(&(), message, |r| r).await
     }
-
-    pub async fn send_message<M: Message>(&self, message: &M) -> Result<(), ProducerError> {
-        let mut record = FutureRecord::to(&self.topic_name).partition(message.partition());
-        if let Some(key) = message.key() {
-            record = record.key(key);
-        }
-        if let Some(payload) = message.payload() {
-            record = record.payload(payload);
-        }
-        // FEAT: Allow configuring the timeout.
-        self.producer
-            .send(record, Timeout::Never)
-            .await
-            .map_err(|error| ProducerError::KafkaError { error: error.0 })?;
-        Ok(())
-    }
 }
 
 pub struct SimpleConsumer<T: de::DeserializeOwned, E: Error + Send> {
@@ -184,7 +191,11 @@ pub enum ConsumerError<E: Debug + Error> {
     NoPayload,
 }
 
-impl<T: de::DeserializeOwned + 'static, E: Error + Send + 'static> SimpleConsumer<T, E> {
+impl<T, E> SimpleConsumer<T, E>
+where
+    T: ser::Serialize + de::DeserializeOwned + Send + 'static,
+    E: ser::Serialize + Error + Send + 'static,
+{
     pub fn new(
         config: KafkaConsumerConfig,
         handler: fn(&T) -> Result<(), E>,
@@ -240,11 +251,7 @@ impl<T: de::DeserializeOwned + 'static, E: Error + Send + 'static> SimpleConsume
             let mut list = TopicPartitionList::new();
             for partition_id in partition_ids {
                 if config.skip_to_latest {
-                    list.add_partition_offset(
-                        &config.topic_name,
-                        partition_id,
-                        Offset::End,
-                    )?;
+                    list.add_partition_offset(&config.topic_name, partition_id, Offset::End)?;
                 } else {
                     list.add_partition(&config.topic_name, partition_id);
                 }
@@ -278,53 +285,65 @@ impl<T: de::DeserializeOwned + 'static, E: Error + Send + 'static> SimpleConsume
         })
     }
 
-    pub fn handle<M: Message>(&self, message: &M) -> Result<(), ConsumerError<E>> {
+    fn decode<M: Message>(&self, message: &M) -> Result<T, ConsumerError<E>> {
         let payload = message.payload().ok_or_else(|| ConsumerError::NoPayload)?;
         // FEAT: Allow the user to select an encoding
         let decoded: T = ciborium::from_reader(Cursor::new(payload))
             .map_err(|error| ConsumerError::DecoderError { error: error })?;
-        (self.handler)(&decoded).map_err(|error| ConsumerError::HandlerError { error })?;
-        Ok(())
+        Ok(decoded)
     }
 
-    pub fn consume(self: &Arc<Self>, owned_msg: OwnedMessage) -> JoinHandle<OwnedMessage> {
+    fn consume(self: &Arc<Self>, owned_msg: OwnedMessage) -> JoinHandle<OwnedMessage> {
         let self_clone = Arc::clone(self);
         tokio::spawn(async move {
-            if let Some(producer) = &self_clone.dlq_producer {
-                match self_clone.handle(&owned_msg) {
-                    // HandlerErrors are sent to the DLQ.
-                    // FEAT: Bundle the error with the message
-                    Err(ConsumerError::HandlerError { error }) => {
-                        log::error!(
-                            "error handling message, sending to the configured DLQ: {error:#?}"
-                        );
-                        while let Err(producer_error) = producer.send_message(&owned_msg).await {
+            match self_clone.decode(&owned_msg) {
+                Ok(message) => {
+                    if let Some(producer) = &self_clone.dlq_producer {
+                        if let Err(error) = (self_clone.handler)(&message) {
+                            // HandlerErrors are sent to the DLQ.
                             log::error!(
-                                "error publishing message to the configured DLQ: {producer_error:#?}"
+                                "error handling message, sending to the configured DLQ: {error:#?}"
                             );
-                            sleep(Duration::from_millis(10)).await;
+                            let dlq_message = DLQMessage {
+                                error: error,
+                                value: message,
+                            };
+                            let key_bytes = if let Some(key) = owned_msg.key() {
+                                key.to_vec()
+                            } else {
+                                Vec::new()
+                            };
+                            let mut payload_bytes: Vec<u8> = Vec::new();
+                            if let Err(encode_error) =
+                                ciborium::into_writer(&dlq_message, &mut payload_bytes)
+                            {
+                                log::error!("error encoding DLQ message: {encode_error:#?}");
+                            } else {
+                                while let Err(producer_error) = producer
+                                    .produce_bytes(&key_bytes, &payload_bytes, |i| i)
+                                    .await
+                                {
+                                    log::error!(
+                                        "error publishing message to the configured DLQ: {producer_error:#?}"
+                                    );
+                                    sleep(Duration::from_millis(10)).await;
+                                }
+                            }
+                        };
+                    } else {
+                        // When there's no DLQ retry indefinitely
+                        // FEAT: Include a handler error type that is unretryable
+                        loop {
+                            if let Err(error) = (self_clone.handler)(&message) {
+                                log::error!("error handling message, retrying: {error:#?}");
+                                sleep(Duration::from_millis(10)).await;
+                            } else {
+                                break;
+                            }
                         }
-                    }
-                    // No payload or decoder errors are skipped
-                    Err(error) => log::error!("error handling message, skipping: {error:#?}"),
-                    _ => (),
-                };
-            } else {
-                // When there's no DLQ retry indefinitely
-                // FEAT: Include a handler error type that is unretryable
-                loop {
-                    match self_clone.handle(&owned_msg) {
-                        Err(ConsumerError::HandlerError { error }) => {
-                            log::error!("error handling message, retrying: {error:#?}");
-                            sleep(Duration::from_millis(10)).await;
-                        }
-                        Err(error) => {
-                            log::error!("error handling message, skipping: {error:#?}");
-                            break;
-                        }
-                        _ => break,
                     }
                 }
+                Err(error) => log::error!("error handling message, skipping: {error:#?}"),
             }
             owned_msg
         })
@@ -415,19 +434,12 @@ impl<T: de::DeserializeOwned + 'static, E: Error + Send + 'static> SimpleConsume
     }
 }
 
-pub fn kafka_producer_from_config(config: KafkaProducerConfig) -> KafkaResult<FutureProducer> {
-    ClientConfig::new()
-        .set("bootstrap.servers", config.host_addrs.join(","))
-        .set("queue.buffering.max.ms", "0") // Do not buffer
-        .set("acks", "1") // Leader only
-        .create()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use rdkafka::mocking::MockCluster;
     use std::collections::HashSet;
+    use std::fmt;
     use std::sync::Mutex;
     use std::sync::OnceLock;
     use std::time::Instant;
@@ -445,6 +457,15 @@ mod tests {
         config.set("test.mock.num.brokers", "1")
     }
 
+    #[derive(Serialize, Deserialize, Debug)]
+    struct TestError {}
+    impl fmt::Display for TestError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "Error")
+        }
+    }
+    impl Error for TestError {}
+
     #[tokio::test]
     async fn initialize_consumer() {
         let test_config = KafkaConsumerConfig {
@@ -455,7 +476,7 @@ mod tests {
             max_threads: 64,
             dlq_config: None,
         };
-        let consumer_result = SimpleConsumer::<(), KafkaError>::new_with_overrides(
+        let consumer_result = SimpleConsumer::<(), TestError>::new_with_overrides(
             test_config,
             |_: &()| Ok(()),
             override_consumer_config,
@@ -484,8 +505,13 @@ mod tests {
     async fn test_producer_consumer_end_to_end() {
         static CONSUMED: OnceLock<Arc<Mutex<Vec<TestMessage>>>> = OnceLock::new();
         assert!(CONSUMED.set(Arc::new(Mutex::new(Vec::new()))).is_ok());
-        fn handler(message: &TestMessage) -> Result<(), KafkaError> {
-            CONSUMED.get().unwrap().lock().unwrap().push(message.clone());
+        fn handler(message: &TestMessage) -> Result<(), TestError> {
+            CONSUMED
+                .get()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .push(message.clone());
             Ok(())
         }
 
@@ -517,7 +543,7 @@ mod tests {
             topic_name: topic_name.to_string(),
         };
 
-        let consumer_result = SimpleConsumer::<TestMessage, KafkaError>::new_with_partitions(
+        let consumer_result = SimpleConsumer::<TestMessage, TestError>::new_with_partitions(
             consumer_config,
             handler,
             Some(vec![0]),
@@ -561,7 +587,7 @@ mod tests {
     async fn test_consumer_multiple_threads() {
         static CONSUMED: OnceLock<Arc<Mutex<Vec<()>>>> = OnceLock::new();
         assert!(CONSUMED.set(Arc::new(Mutex::new(Vec::new()))).is_ok());
-        fn handler(message: &()) -> Result<(), KafkaError> {
+        fn handler(message: &()) -> Result<(), TestError> {
             // Use thread sleep so that the function is not async.
             std::thread::sleep(Duration::from_millis(50));
             CONSUMED.get().unwrap().lock().unwrap().push(*message);
@@ -586,7 +612,7 @@ mod tests {
             topic_name: topic_name.to_string(),
         };
 
-        let consumer_result = SimpleConsumer::<(), KafkaError>::new_with_partitions(
+        let consumer_result = SimpleConsumer::<(), TestError>::new_with_partitions(
             consumer_config,
             handler,
             Some(vec![0]),
@@ -624,6 +650,5 @@ mod tests {
         assert_eq!(consumed_messages.len(), message_count);
 
         consumer_handle.abort();
-
     }
 }
