@@ -219,11 +219,11 @@ impl ConsumerContext for SimpleConsumerContext {
     }
 }
 
-pub trait Retryable {
+pub trait Retryable: Error {
     fn retryable(&self) -> bool;
 }
 
-pub struct SimpleConsumer<T: de::DeserializeOwned, E: Error + Retryable + Send> {
+pub struct SimpleConsumer<T: de::DeserializeOwned, E: Retryable + Send> {
     consumer: StreamConsumer<SimpleConsumerContext>,
     handler: fn(&T) -> Result<(), E>,
     max_threads: i32,
@@ -231,7 +231,7 @@ pub struct SimpleConsumer<T: de::DeserializeOwned, E: Error + Retryable + Send> 
 }
 
 #[derive(Debug)]
-pub enum ConsumerError<E: Debug + Error> {
+pub enum ConsumerError<E: Retryable> {
     KafkaError {
         error: KafkaError,
     },
@@ -243,11 +243,34 @@ pub enum ConsumerError<E: Debug + Error> {
     },
     NoPayload,
 }
+impl<E: Retryable> std::fmt::Display for ConsumerError<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self {
+            &ConsumerError::KafkaError { error } => write!(f, "Kafka error: {}", error),
+            &ConsumerError::HandlerError { error } => write!(f, "Handler error: {}", error),
+            &ConsumerError::DecoderError { error } => write!(f, "Decoder error: {}", error),
+            &ConsumerError::NoPayload => write!(f, "No payload"),
+        }
+    }
+}
+impl<E: Retryable> Error for ConsumerError<E> {}
+impl<E: Retryable> Retryable for ConsumerError<E> {
+    fn retryable(&self) -> bool {
+        match &self {
+            // Not enough information is known about the underlying KafkaErrors that are
+            // unretryable so they are all assumed to be retryable.
+            &ConsumerError::KafkaError { error: _ } => true,
+            &ConsumerError::HandlerError { error } => error.retryable(),
+            &ConsumerError::DecoderError { error: _ } => false,
+            &ConsumerError::NoPayload => false,
+        }
+    }
+}
 
 impl<T, E> SimpleConsumer<T, E>
 where
     T: ser::Serialize + de::DeserializeOwned + Send + 'static,
-    E: ser::Serialize + Error + Retryable + Send + 'static,
+    E: ser::Serialize + Retryable + Send + 'static,
 {
     pub fn new(
         config: KafkaConsumerConfig,
@@ -379,7 +402,6 @@ where
                         };
                     } else {
                         // When there's no DLQ retry indefinitely
-                        // FEAT: Include a handler error type that is unretryable
                         loop {
                             if let Err(error) = (self_clone.handler)(&message)
                                 && error.retryable()
