@@ -3,18 +3,18 @@ use std::collections::BinaryHeap;
 use std::error::Error;
 use std::fmt::Debug;
 use std::io::Cursor;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use ciborium;
 use rdkafka::config::ClientConfig;
-use rdkafka::consumer::Consumer;
 use rdkafka::consumer::stream_consumer::StreamConsumer;
+use rdkafka::consumer::{BaseConsumer, Consumer, ConsumerContext, Rebalance};
 use rdkafka::error::{KafkaError, KafkaResult};
 use rdkafka::message::OwnedMessage;
-use rdkafka::producer::{FutureProducer, FutureRecord};
+use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
 use rdkafka::topic_partition_list::Offset;
 use rdkafka::util::Timeout;
-use rdkafka::{Message, TopicPartitionList};
+use rdkafka::{ClientContext, Message, TopicPartitionList};
 use serde::{Deserialize, Serialize, de, ser};
 use tokio;
 use tokio::task::JoinHandle;
@@ -55,6 +55,7 @@ where
 pub struct KafkaProducerConfig {
     pub host_addrs: Vec<String>,
     pub topic_name: String,
+    pub timeout: Duration,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -70,6 +71,7 @@ pub struct KafkaConsumerConfig {
 pub struct SimpleProducer {
     producer: FutureProducer,
     topic_name: String,
+    timeout: Duration,
 }
 
 #[derive(Debug)]
@@ -103,6 +105,7 @@ impl SimpleProducer {
         Ok(SimpleProducer {
             topic_name: config.topic_name,
             producer,
+            timeout: config.timeout,
         })
     }
 
@@ -110,6 +113,7 @@ impl SimpleProducer {
         &self,
         key: &K,
         payload: &V,
+        sync: bool,
         record_builder: F,
     ) -> Result<(), ProducerError>
     where
@@ -123,7 +127,7 @@ impl SimpleProducer {
             .map_err(|error| ProducerError::EncoderError { error })?;
         ciborium::into_writer(&payload, &mut payload_bytes)
             .map_err(|error| ProducerError::EncoderError { error })?;
-        self.produce_bytes(&key_bytes, &payload_bytes, record_builder)
+        self.produce_bytes(&key_bytes, &payload_bytes, sync, record_builder)
             .await
     }
 
@@ -131,6 +135,7 @@ impl SimpleProducer {
         &self,
         key_bytes: &Vec<u8>,
         payload_bytes: &Vec<u8>,
+        sync: bool,
         record_builder: F,
     ) -> Result<(), ProducerError>
     where
@@ -141,37 +146,85 @@ impl SimpleProducer {
                 .key(key_bytes)
                 .payload(payload_bytes),
         );
-        // FEAT: Allow configuring the timeout
+        let mut timeout = Timeout::Never;
+        if !sync {
+            timeout = Timeout::After(self.timeout);
+        }
         self.producer
-            .send(record, Timeout::Never)
+            .send(record, timeout)
             .await
             .map_err(|error| ProducerError::KafkaError { error: error.0 })?;
+        if sync {
+            self.flush(timeout)?;
+        }
         Ok(())
+    }
+
+    pub fn flush(&self, timeout: Timeout) -> Result<(), ProducerError> {
+        self.producer
+            .flush(timeout)
+            .map_err(|error| ProducerError::KafkaError { error })
     }
 
     pub async fn send_with_key<K: ser::Serialize, V: ser::Serialize>(
         &self,
         key: &K,
         value: &V,
+        sync: bool,
     ) -> Result<(), ProducerError> {
-        self.produce(key, value, |r| r).await
+        self.produce(key, value, sync, |r| r).await
     }
 
     pub async fn send_with_partition<T: ser::Serialize>(
         &self,
         message: &T,
         partition: i32,
+        sync: bool,
     ) -> Result<(), ProducerError> {
-        self.produce(&(), message, |r| r.partition(partition)).await
+        self.produce(&(), message, sync, |r| r.partition(partition))
+            .await
     }
 
-    pub async fn send<T: ser::Serialize>(&self, message: &T) -> Result<(), ProducerError> {
-        self.produce(&(), message, |r| r).await
+    pub async fn send<T: ser::Serialize>(
+        &self,
+        message: &T,
+        sync: bool,
+    ) -> Result<(), ProducerError> {
+        self.produce(&(), message, sync, |r| r).await
     }
 }
 
-pub struct SimpleConsumer<T: de::DeserializeOwned, E: Error + Send> {
-    consumer: StreamConsumer,
+struct SimpleConsumerContext {
+    skip_to_latest: bool,
+    rebalanced: OnceLock<()>,
+}
+impl ClientContext for SimpleConsumerContext {}
+impl ConsumerContext for SimpleConsumerContext {
+    fn post_rebalance(&self, consumer: &BaseConsumer<Self>, rebalance: &Rebalance) {
+        match rebalance {
+            Rebalance::Assign(tpl) => {
+                if self.skip_to_latest && self.rebalanced.get().is_none() {
+                    self.rebalanced.set(()).ok();
+                    for ((topic, partition_id), offset) in tpl.to_topic_map() {
+                        if offset != Offset::End {
+                            consumer
+                                .seek(&topic, partition_id, Offset::End, Timeout::Never)
+                                .ok();
+                        }
+                    }
+                }
+            }
+            _ => (),
+        }
+    }
+}
+
+pub trait Retryable {
+    fn retryable(&self) -> bool;
+}
+
+pub struct SimpleConsumer<T: de::DeserializeOwned, E: Error + Retryable + Send> {
+    consumer: StreamConsumer<SimpleConsumerContext>,
     handler: fn(&T) -> Result<(), E>,
     max_threads: i32,
     dlq_producer: Option<SimpleProducer>,
@@ -194,7 +247,7 @@ pub enum ConsumerError<E: Debug + Error> {
 impl<T, E> SimpleConsumer<T, E>
 where
     T: ser::Serialize + de::DeserializeOwned + Send + 'static,
-    E: ser::Serialize + Error + Send + 'static,
+    E: ser::Serialize + Error + Retryable + Send + 'static,
 {
     pub fn new(
         config: KafkaConsumerConfig,
@@ -246,7 +299,12 @@ where
                     "earliest"
                 },
             );
-        let consumer: StreamConsumer = overrides(base_config).create()?;
+        let context = SimpleConsumerContext {
+            skip_to_latest: config.skip_to_latest,
+            rebalanced: OnceLock::new(),
+        };
+        let consumer: StreamConsumer<SimpleConsumerContext> =
+            overrides(base_config).create_with_context(context)?;
         if let Some(partition_ids) = partitions {
             let mut list = TopicPartitionList::new();
             for partition_id in partition_ids {
@@ -258,19 +316,8 @@ where
             }
             consumer.assign(&list)?;
         } else {
+            // Skip to latest is implemented in the consumer context for regular subscriptions
             consumer.subscribe(&[config.topic_name.as_str()])?;
-            // FEAT: This code should be ran on post_rebalance and requires defining a CounsumerContext.
-            /*
-            if config.skip_to_latest {
-                if let Ok(tpl) = consumer.subscription() {
-                    for ((topic, partition_id), offset) in tpl.to_topic_map() {
-                        if offset != Offset::End {
-                            consumer.seek(&topic, partition_id, Offset::End, Timeout::After(Duration::from_secs(1)))?;
-                        }
-                    }
-                }
-            }
-            */
         }
         let dlq_producer = if let Some(dlq_config) = config.dlq_config {
             Some(SimpleProducer::new(dlq_config)?)
@@ -320,7 +367,7 @@ where
                                 log::error!("error encoding DLQ message: {encode_error:#?}");
                             } else {
                                 while let Err(producer_error) = producer
-                                    .produce_bytes(&key_bytes, &payload_bytes, |i| i)
+                                    .produce_bytes(&key_bytes, &payload_bytes, true, |i| i)
                                     .await
                                 {
                                     log::error!(
@@ -334,7 +381,9 @@ where
                         // When there's no DLQ retry indefinitely
                         // FEAT: Include a handler error type that is unretryable
                         loop {
-                            if let Err(error) = (self_clone.handler)(&message) {
+                            if let Err(error) = (self_clone.handler)(&message)
+                                && error.retryable()
+                            {
                                 log::error!("error handling message, retrying: {error:#?}");
                                 sleep(Duration::from_millis(10)).await;
                             } else {
@@ -392,7 +441,6 @@ where
                 }
                 if let Some(message) = commitable_message {
                     // If the commit fails it's fine because we will commit later offsets as we go.
-                    // FEAT: Allow the user to configure the commit mode (async vs sync)
                     let mut tpl = TopicPartitionList::new();
                     if let Err(commit_err) = tpl.add_partition_offset(
                         message.0.topic(),
@@ -408,7 +456,6 @@ where
                     }
                 }
                 // If we don't receive a message in 10ms then loop again to check for completed consumes.
-                // FEAT: Allow the user to configure this timeout.
                 if let Some(result) = timeout(Duration::from_millis(10), self_clone.consumer.recv())
                     .await
                     .ok()
@@ -441,7 +488,6 @@ mod tests {
     use std::collections::HashSet;
     use std::fmt;
     use std::sync::Mutex;
-    use std::sync::OnceLock;
     use std::time::Instant;
 
     #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
@@ -465,6 +511,11 @@ mod tests {
         }
     }
     impl Error for TestError {}
+    impl Retryable for TestError {
+        fn retryable(&self) -> bool {
+            true
+        }
+    }
 
     #[tokio::test]
     async fn initialize_consumer() {
@@ -492,12 +543,13 @@ mod tests {
         let producer_config = KafkaProducerConfig {
             host_addrs: Vec::new(),
             topic_name: "test_produce_topic".to_string(),
+            timeout: Duration::from_secs(1),
         };
         let producer_result =
             SimpleProducer::new_with_overrides(producer_config, override_producer_config);
         assert!(producer_result.is_ok());
         let producer = producer_result.unwrap();
-        let result = producer.send(&()).await;
+        let result = producer.send(&(), true).await;
         assert!(result.is_ok());
     }
 
@@ -541,6 +593,7 @@ mod tests {
         let producer_config = KafkaProducerConfig {
             host_addrs: vec![bootstrap_servers.clone()],
             topic_name: topic_name.to_string(),
+            timeout: Duration::from_secs(1),
         };
 
         let consumer_result = SimpleConsumer::<TestMessage, TestError>::new_with_partitions(
@@ -556,12 +609,12 @@ mod tests {
         let producer = producer_result.unwrap();
 
         // Check that messages produced before the consumer starts are consumed.
-        assert!(producer.send(&test_msg1).await.is_ok());
+        assert!(producer.send(&test_msg1, true).await.is_ok());
 
         let consumer_handle = consumer.run_consumer();
 
-        assert!(producer.send(&test_msg2).await.is_ok());
-        assert!(producer.send(&test_msg3).await.is_ok());
+        assert!(producer.send(&test_msg2, true).await.is_ok());
+        assert!(producer.send(&test_msg3, true).await.is_ok());
 
         let timeout = Instant::now() + Duration::from_secs(1);
         while Instant::now() < timeout {
@@ -610,6 +663,7 @@ mod tests {
         let producer_config = KafkaProducerConfig {
             host_addrs: vec![bootstrap_servers.clone()],
             topic_name: topic_name.to_string(),
+            timeout: Duration::from_secs(1),
         };
 
         let consumer_result = SimpleConsumer::<(), TestError>::new_with_partitions(
@@ -627,14 +681,14 @@ mod tests {
         let mut message_count = 0;
         // Produce a bunch of messages so that there is a backlog to take up the threads.
         for _ in 0..100 {
-            assert!(producer.send(&()).await.is_ok());
+            assert!(producer.send(&(), true).await.is_ok());
             message_count += 1;
         }
 
         let consumer_handle = consumer.run_consumer();
 
         for _ in 100..200 {
-            assert!(producer.send(&()).await.is_ok());
+            assert!(producer.send(&(), true).await.is_ok());
             message_count += 1;
         }
 
