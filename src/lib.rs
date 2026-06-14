@@ -1,5 +1,6 @@
 pub mod config;
 pub mod consumer;
+pub mod dlq;
 pub mod producer;
 pub mod retryable;
 

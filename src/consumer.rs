@@ -1,4 +1,5 @@
 use crate::config::*;
+use crate::dlq::*;
 use crate::producer::*;
 use crate::retryable::*;
 
@@ -18,29 +19,11 @@ use rdkafka::message::OwnedMessage;
 use rdkafka::topic_partition_list::Offset;
 use rdkafka::util::Timeout;
 use rdkafka::{ClientContext, Message, TopicPartitionList};
-use serde::{Deserialize, Serialize, de, ser};
+use serde::{de, ser};
 use tokio;
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, sleep, timeout};
 use tokio_util::sync::CancellationToken;
-
-#[derive(Clone, Serialize, Deserialize, Debug)]
-pub enum DLQData<V>
-where
-  V: ser::Serialize,
-{
-  Message(V),
-  Bytes(Vec<u8>),
-}
-
-#[derive(Clone, Serialize, Deserialize, Debug)]
-pub struct DLQMessage<V>
-where
-  V: ser::Serialize,
-{
-  pub error: String,
-  pub value: DLQData<V>,
-}
 
 // For storing messages in a min heap based on offset
 struct MessageReverseOrd(OwnedMessage);
@@ -126,10 +109,10 @@ impl ConsumerContext for SimpleConsumerContext {
 /// Use this to consume messages from a single kafka topic. Configured with `config::ConsumerConfig`.
 /// This consumer decodes messages as ciborium format and is intended to be used with `SimpleProducer`.
 ///
-/// A DLQ can be configured, when one is configured failed messages will always be enqueued to the DLQ,
-/// regardless of whether or not they are retryable. When no DLQ is configured failed messages will be
-/// retried indefinitely unless they are not retryable, in which case they will be dropped. Messages
-/// that cannot be decoded will be dropped unless there is a configured DLQ.
+/// A dead letter queue (DLQ) can be configured, when one is configured failed messages will always
+/// be sent to the DLQ, regardless of whether or not they are retryable. When no DLQ is configured
+/// failed messages will be retried indefinitely unless they are not retryable, in which case they
+/// will be dropped. Messages that cannot be decoded will be dropped unless there is a configured DLQ.
 ///
 /// The consumer will process up to `max_threads` messages in parallel and will commit offsets in order.
 /// Offsets are only committed after the handler function has finished running, thus ensuring
