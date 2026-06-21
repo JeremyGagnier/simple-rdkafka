@@ -2,6 +2,9 @@
 name = "simple-rdkafka"
 version = "0.0.1"
 edition = "2024"
+authors = ["Jeremy Gagnier <jer.gagnier@gmail.com>"]
+description = "Provides producer and consumer wrappers to enable easy application development of performant streaming applications."
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 ciborium = "0.2.2"

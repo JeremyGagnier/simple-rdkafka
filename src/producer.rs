@@ -154,6 +154,7 @@ impl SimpleProducer {
     Ok(())
   }
 
+  /// If you send without `sync = true` you can use `flush` to ensure that messages are sent.
   pub fn flush(&self, timeout: Timeout) -> Result<(), ProducerError> {
     self
       .producer
@@ -178,6 +179,18 @@ impl SimpleProducer {
   ) -> Result<(), ProducerError> {
     self
       .produce(&(), message, sync, |r| r.partition(partition))
+      .await
+  }
+
+  pub async fn send_with_key_and_partition<K: ser::Serialize, V: ser::Serialize>(
+    &self,
+    key: &K,
+    value: &V,
+    partition: i32,
+    sync: bool,
+  ) -> Result<(), ProducerError> {
+    self
+      .produce(key, value, sync, |r| r.partition(partition))
       .await
   }
 

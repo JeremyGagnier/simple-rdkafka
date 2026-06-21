@@ -25,6 +25,9 @@ use tokio::task::JoinHandle;
 use tokio::time::{Duration, sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
+// FEAT: Make logging optional but on by default
+// FEAT: Add optional metrics, off by default
+
 // For storing messages in a min heap based on offset
 struct MessageReverseOrd(OwnedMessage);
 impl Ord for MessageReverseOrd {
@@ -108,6 +111,7 @@ impl ConsumerContext for SimpleConsumerContext {
 
 /// Use this to consume messages from a single kafka topic. Configured with `config::ConsumerConfig`.
 /// This consumer decodes messages as ciborium format and is intended to be used with `SimpleProducer`.
+/// Kafka message keys are ignored.
 ///
 /// A dead letter queue (DLQ) can be configured, when one is configured failed messages will always
 /// be sent to the DLQ, regardless of whether or not they are retryable. When no DLQ is configured
@@ -272,18 +276,13 @@ where
     Ok(decoded)
   }
 
-  async fn send_to_dlq(producer: &SimpleProducer, message: DLQMessage<T>, key_opt: Option<&[u8]>) {
-    let key_bytes = if let Some(key) = key_opt {
-      key.to_vec()
-    } else {
-      Vec::new()
-    };
+  async fn send_to_dlq(producer: &SimpleProducer, message: DLQMessage<T>) {
     let mut payload_bytes: Vec<u8> = Vec::new();
     if let Err(encode_error) = ciborium::into_writer(&message, &mut payload_bytes) {
       log::error!("error encoding DLQ message: {encode_error:#?}");
     } else {
       while let Err(producer_error) = producer
-        .produce_bytes(&key_bytes, &payload_bytes, true, |i| i)
+        .produce_bytes(&Vec::new(), &payload_bytes, true, |i| i)
         .await
       {
         log::error!("error publishing message to the configured DLQ: {producer_error:#?}");
@@ -304,8 +303,9 @@ where
               let dlq_message = DLQMessage {
                 error: error.to_string(),
                 value: DLQData::Message(message),
+                partition: owned_msg.partition(),
               };
-              SimpleConsumer::<T, E>::send_to_dlq(producer, dlq_message, owned_msg.key()).await;
+              SimpleConsumer::<T, E>::send_to_dlq(producer, dlq_message).await;
             };
           } else {
             // When there's no DLQ retry indefinitely, unless the error from the handler is not retryable.
@@ -328,8 +328,9 @@ where
             let dlq_message = DLQMessage {
               error: error.to_string(),
               value: DLQData::Bytes::<T>(payload.to_vec()),
+              partition: owned_msg.partition(),
             };
-            SimpleConsumer::<T, E>::send_to_dlq(producer, dlq_message, owned_msg.key()).await;
+            SimpleConsumer::<T, E>::send_to_dlq(producer, dlq_message).await;
           } else {
             log::error!("error handling message, skipping: {error:#?}")
           }
