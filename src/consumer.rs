@@ -8,6 +8,7 @@ use std::collections::BinaryHeap;
 use std::error::Error;
 use std::fmt::Debug;
 use std::io::Cursor;
+use std::marker::PhantomData;
 use std::sync::{Arc, OnceLock};
 
 use ciborium;
@@ -174,29 +175,34 @@ impl ConsumerContext for SimpleConsumerContext {
 /// }
 /// ```
 ///
-pub struct SimpleConsumer<T: de::DeserializeOwned, E: Retryable + Send> {
+pub struct SimpleConsumer<T, E, H>
+where
+  T: de::DeserializeOwned,
+  E: Retryable + Send,
+  H: Fn(&T) -> Result<(), E> + Sync + Send + 'static,
+{
   consumer: StreamConsumer<SimpleConsumerContext>,
-  handler: fn(&T) -> Result<(), E>,
+  handler: H,
   max_threads: i32,
   dlq_producer: Option<SimpleProducer>,
+  _marker_t: PhantomData<fn() -> T>,
+  _marker_e: PhantomData<fn() -> E>,
 }
-impl<T, E> SimpleConsumer<T, E>
+impl<T, E, H> SimpleConsumer<T, E, H>
 where
   T: ser::Serialize + de::DeserializeOwned + Send + 'static,
   E: ser::Serialize + Retryable + Send + 'static,
+  H: Fn(&T) -> Result<(), E> + Sync + Send + 'static,
 {
-  pub fn new(
-    config: ConsumerConfig,
-    handler: fn(&T) -> Result<(), E>,
-  ) -> KafkaResult<SimpleConsumer<T, E>> {
+  pub fn new(config: ConsumerConfig, handler: H) -> KafkaResult<SimpleConsumer<T, E, H>> {
     SimpleConsumer::new_with_overrides_and_partitions(config, handler, |c| c, None)
   }
 
   pub fn new_with_overrides<F>(
     config: ConsumerConfig,
-    handler: fn(&T) -> Result<(), E>,
+    handler: H,
     overrides: F,
-  ) -> KafkaResult<SimpleConsumer<T, E>>
+  ) -> KafkaResult<SimpleConsumer<T, E, H>>
   where
     F: FnOnce(&mut ClientConfig) -> &mut ClientConfig,
   {
@@ -205,18 +211,18 @@ where
 
   pub fn new_with_partitions(
     config: ConsumerConfig,
-    handler: fn(&T) -> Result<(), E>,
+    handler: H,
     partitions: Option<Vec<i32>>,
-  ) -> KafkaResult<SimpleConsumer<T, E>> {
+  ) -> KafkaResult<SimpleConsumer<T, E, H>> {
     SimpleConsumer::new_with_overrides_and_partitions(config, handler, |c| c, partitions)
   }
 
   pub fn new_with_overrides_and_partitions<F>(
     config: ConsumerConfig,
-    handler: fn(&T) -> Result<(), E>,
+    handler: H,
     overrides: F,
     partitions: Option<Vec<i32>>,
-  ) -> KafkaResult<SimpleConsumer<T, E>>
+  ) -> KafkaResult<SimpleConsumer<T, E, H>>
   where
     F: FnOnce(&mut ClientConfig) -> &mut ClientConfig,
   {
@@ -265,6 +271,8 @@ where
       handler: handler,
       max_threads: config.max_threads,
       dlq_producer: dlq_producer,
+      _marker_t: PhantomData,
+      _marker_e: PhantomData,
     })
   }
 
@@ -305,7 +313,7 @@ where
                 value: DLQData::Message(message),
                 partition: owned_msg.partition(),
               };
-              SimpleConsumer::<T, E>::send_to_dlq(producer, dlq_message).await;
+              SimpleConsumer::<T, E, H>::send_to_dlq(producer, dlq_message).await;
             };
           } else {
             // When there's no DLQ retry indefinitely, unless the error from the handler is not retryable.
@@ -330,7 +338,7 @@ where
               value: DLQData::Bytes::<T>(payload.to_vec()),
               partition: owned_msg.partition(),
             };
-            SimpleConsumer::<T, E>::send_to_dlq(producer, dlq_message).await;
+            SimpleConsumer::<T, E, H>::send_to_dlq(producer, dlq_message).await;
           } else {
             log::error!("error handling message, skipping: {error:#?}")
           }

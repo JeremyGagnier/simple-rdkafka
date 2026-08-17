@@ -63,11 +63,12 @@ mod tests {
       max_threads: 64,
       dlq_config: None,
     };
-    let consumer_result = SimpleConsumer::<(), TestError>::new_with_overrides(
-      test_config,
-      |_: &()| Ok(()),
-      override_consumer_config,
-    );
+    let consumer_result =
+      SimpleConsumer::<(), TestError, fn(&()) -> Result<(), TestError>>::new_with_overrides(
+        test_config,
+        |_: &()| Ok(()),
+        override_consumer_config,
+      );
     assert!(consumer_result.is_ok());
     let consumer = consumer_result.unwrap();
     let handle = consumer.run_consumer(CancellationToken::new());
@@ -132,11 +133,8 @@ mod tests {
       timeout: Duration::from_secs(1),
     };
 
-    let consumer_result = SimpleConsumer::<TestMessage, TestError>::new_with_partitions(
-      consumer_config,
-      handler,
-      Some(vec![0]),
-    );
+    let consumer_result =
+      SimpleConsumer::new_with_partitions(consumer_config, handler, Some(vec![0]));
     assert!(consumer_result.is_ok());
     let consumer = consumer_result.unwrap();
 
@@ -202,7 +200,7 @@ mod tests {
     };
 
     let consumer_result =
-      SimpleConsumer::<(), TestError>::new_with_partitions(consumer_config, handler, Some(vec![0]));
+      SimpleConsumer::new_with_partitions(consumer_config, handler, Some(vec![0]));
     assert!(consumer_result.is_ok());
     let consumer = consumer_result.unwrap();
 
