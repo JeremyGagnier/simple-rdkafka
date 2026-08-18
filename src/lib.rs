@@ -63,12 +63,11 @@ mod tests {
       max_threads: 64,
       dlq_config: None,
     };
+    async fn handler(_: ()) -> Result<(), TestError> {
+      Ok(())
+    }
     let consumer_result =
-      SimpleConsumer::<(), TestError, fn(&()) -> Result<(), TestError>>::new_with_overrides(
-        test_config,
-        |_: &()| Ok(()),
-        override_consumer_config,
-      );
+      SimpleConsumer::new_with_overrides(test_config, handler, override_consumer_config);
     assert!(consumer_result.is_ok());
     let consumer = consumer_result.unwrap();
     let handle = consumer.run_consumer(CancellationToken::new());
@@ -94,13 +93,8 @@ mod tests {
   async fn test_producer_consumer_end_to_end() {
     static CONSUMED: OnceLock<Arc<Mutex<Vec<TestMessage>>>> = OnceLock::new();
     assert!(CONSUMED.set(Arc::new(Mutex::new(Vec::new()))).is_ok());
-    fn handler(message: &TestMessage) -> Result<(), TestError> {
-      CONSUMED
-        .get()
-        .unwrap()
-        .lock()
-        .unwrap()
-        .push(message.clone());
+    async fn handler(message: TestMessage) -> Result<(), TestError> {
+      CONSUMED.get().unwrap().lock().unwrap().push(message);
       Ok(())
     }
 
@@ -173,10 +167,10 @@ mod tests {
   async fn test_consumer_multiple_threads() {
     static CONSUMED: OnceLock<Arc<Mutex<Vec<()>>>> = OnceLock::new();
     assert!(CONSUMED.set(Arc::new(Mutex::new(Vec::new()))).is_ok());
-    fn handler(message: &()) -> Result<(), TestError> {
+    async fn handler(message: ()) -> Result<(), TestError> {
       // Use thread sleep so that the function is not async.
       std::thread::sleep(Duration::from_millis(50));
-      CONSUMED.get().unwrap().lock().unwrap().push(*message);
+      CONSUMED.get().unwrap().lock().unwrap().push(message);
       Ok(())
     }
 

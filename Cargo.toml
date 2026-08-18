@@ -1,6 +1,6 @@
 [package]
 name = "simple-rdkafka"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 authors = ["Jeremy Gagnier <jer.gagnier@gmail.com>"]
 description = "Provides producer and consumer wrappers to enable easy application development of performant streaming applications."

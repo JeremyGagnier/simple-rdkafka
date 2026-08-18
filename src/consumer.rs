@@ -132,7 +132,7 @@ impl ConsumerContext for SimpleConsumerContext {
 /// use serde::{Deserialize, Serialize};
 /// use tokio_util::sync::CancellationToken;
 ///
-/// #[derive(Deserialize, Serialize)]
+/// #[derive(Clone, Deserialize, Serialize)]
 /// struct Message {
 ///   text: String,
 /// }
@@ -153,7 +153,7 @@ impl ConsumerContext for SimpleConsumerContext {
 /// impl std::error::Error for MyError {}
 ///
 ///
-/// fn handler(msg: &Message) -> Result<(), MyError> {
+/// async fn handler(msg: Message) -> Result<(), MyError> {
 ///   println!("received: {}", msg.text);
 ///   Ok(())
 /// }
@@ -175,11 +175,12 @@ impl ConsumerContext for SimpleConsumerContext {
 /// }
 /// ```
 ///
-pub struct SimpleConsumer<T, E, H>
+pub struct SimpleConsumer<T, E, H, Fut>
 where
-  T: de::DeserializeOwned,
-  E: Retryable + Send,
-  H: Fn(&T) -> Result<(), E> + Sync + Send + 'static,
+  T: Clone + ser::Serialize + de::DeserializeOwned + Send + 'static,
+  E: ser::Serialize + Retryable + Send + 'static,
+  H: Fn(T) -> Fut + Sync + Send + 'static,
+  Fut: Future<Output = Result<(), E>> + Send + 'static,
 {
   consumer: StreamConsumer<SimpleConsumerContext>,
   handler: H,
@@ -188,13 +189,14 @@ where
   _marker_t: PhantomData<fn() -> T>,
   _marker_e: PhantomData<fn() -> E>,
 }
-impl<T, E, H> SimpleConsumer<T, E, H>
+impl<T, E, H, Fut> SimpleConsumer<T, E, H, Fut>
 where
-  T: ser::Serialize + de::DeserializeOwned + Send + 'static,
+  T: Clone + ser::Serialize + de::DeserializeOwned + Send + 'static,
   E: ser::Serialize + Retryable + Send + 'static,
-  H: Fn(&T) -> Result<(), E> + Sync + Send + 'static,
+  H: Fn(T) -> Fut + Sync + Send + 'static,
+  Fut: Future<Output = Result<(), E>> + Send + 'static,
 {
-  pub fn new(config: ConsumerConfig, handler: H) -> KafkaResult<SimpleConsumer<T, E, H>> {
+  pub fn new(config: ConsumerConfig, handler: H) -> KafkaResult<SimpleConsumer<T, E, H, Fut>> {
     SimpleConsumer::new_with_overrides_and_partitions(config, handler, |c| c, None)
   }
 
@@ -202,7 +204,7 @@ where
     config: ConsumerConfig,
     handler: H,
     overrides: F,
-  ) -> KafkaResult<SimpleConsumer<T, E, H>>
+  ) -> KafkaResult<SimpleConsumer<T, E, H, Fut>>
   where
     F: FnOnce(&mut ClientConfig) -> &mut ClientConfig,
   {
@@ -213,7 +215,7 @@ where
     config: ConsumerConfig,
     handler: H,
     partitions: Option<Vec<i32>>,
-  ) -> KafkaResult<SimpleConsumer<T, E, H>> {
+  ) -> KafkaResult<SimpleConsumer<T, E, H, Fut>> {
     SimpleConsumer::new_with_overrides_and_partitions(config, handler, |c| c, partitions)
   }
 
@@ -222,7 +224,7 @@ where
     handler: H,
     overrides: F,
     partitions: Option<Vec<i32>>,
-  ) -> KafkaResult<SimpleConsumer<T, E, H>>
+  ) -> KafkaResult<SimpleConsumer<T, E, H, Fut>>
   where
     F: FnOnce(&mut ClientConfig) -> &mut ClientConfig,
   {
@@ -305,7 +307,7 @@ where
       match self_clone.decode(&owned_msg) {
         Ok(message) => {
           if let Some(producer) = &self_clone.dlq_producer {
-            if let Err(error) = (self_clone.handler)(&message) {
+            if let Err(error) = (self_clone.handler)(message.clone()).await {
               // HandlerErrors are sent to the DLQ.
               log::error!("error handling message, sending to the configured DLQ: {error:#?}");
               let dlq_message = DLQMessage {
@@ -313,12 +315,12 @@ where
                 value: DLQData::Message(message),
                 partition: owned_msg.partition(),
               };
-              SimpleConsumer::<T, E, H>::send_to_dlq(producer, dlq_message).await;
+              SimpleConsumer::<T, E, H, Fut>::send_to_dlq(producer, dlq_message).await;
             };
           } else {
             // When there's no DLQ retry indefinitely, unless the error from the handler is not retryable.
             loop {
-              if let Err(error) = (self_clone.handler)(&message)
+              if let Err(error) = (self_clone.handler)(message.clone()).await
                 && error.retryable()
               {
                 log::error!("error handling message, retrying: {error:#?}");
@@ -338,7 +340,7 @@ where
               value: DLQData::Bytes::<T>(payload.to_vec()),
               partition: owned_msg.partition(),
             };
-            SimpleConsumer::<T, E, H>::send_to_dlq(producer, dlq_message).await;
+            SimpleConsumer::<T, E, H, Fut>::send_to_dlq(producer, dlq_message).await;
           } else {
             log::error!("error handling message, skipping: {error:#?}")
           }
